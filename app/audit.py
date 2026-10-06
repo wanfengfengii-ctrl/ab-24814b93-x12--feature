@@ -50,17 +50,47 @@ class EnvelopeError(Exception):
 
 
 @dataclass(frozen=True)
+class TransactionDetail:
+    """Raw-byte evidence for one ST/SE transaction set.
+
+    ``gs_control_number`` is the owning group's GS06.  ``st_segment`` and
+    ``se_segment`` are 1-based segment indexes (ISA is segment 1);
+    ``byte_start``/``byte_end`` are zero-based half-open byte offsets into
+    the original message, covering the first byte of the ST tag through the
+    SE segment terminator.  ``sha256`` is the lowercase hex digest of that
+    exact, unmodified slice.
+    """
+
+    gs_control_number: str
+    st01: str
+    st02: str
+    st_segment: int
+    se_segment: int
+    byte_start: int
+    byte_end: int
+    sha256: str
+
+
+@dataclass(frozen=True)
 class AuditResult:
     interchange_control_number: str
     group_count: int
     transaction_count: int
     sha256: str
+    # Ordered first by functional group (document order) and then by
+    # transaction set within the group.  Populated only when
+    # ``include_transactions=True`` is requested.
+    transactions: tuple[TransactionDetail, ...] = ()
 
 
 @dataclass
 class _Transaction:
     st_index: int
     control_number: bytes
+    st01: bytes
+    byte_start: int
+    se_index: int = 0
+    byte_end: int = 0
 
 
 @dataclass
@@ -77,8 +107,18 @@ def _is_printable_punctuation(value: int) -> bool:
     return not (ch.isalnum() or ch == " ")
 
 
-def audit(raw: bytes) -> AuditResult:
-    """Audit a raw X12 message and return its envelope summary."""
+def audit(
+    raw: bytes, *, include_transactions: bool = False
+) -> AuditResult:
+    """Audit a raw X12 message and return its envelope summary.
+
+    When ``include_transactions`` is true the result additionally carries a
+    ``transactions`` tuple (ordered by group, then document order) with the
+    raw-byte span and SHA-256 of every ST..SE transaction set.  The detail
+    is assembled only after the whole envelope has validated successfully,
+    so it can never mask an earlier inner error and is never present on a
+    failed audit.
+    """
 
     if len(raw) == 0:
         raise EnvelopeError("EMPTY_MESSAGE", "request body is empty", 1)
@@ -174,8 +214,23 @@ def audit(raw: bytes) -> AuditResult:
     def tag_of(token: bytes) -> bytes:
         return token.split(element_sep_byte, 1)[0].strip()
 
+    # Byte offset at which the current split token starts.  Token 0 is the
+    # ISA core; it is followed by one terminator byte, so token 1 starts at
+    # len(isa_core) + 1.
+    cursor = len(raw_tokens[0]) + 1
+    strip_chars = b" \t\r\n"
+
     for position, raw_token in enumerate(raw_tokens[1:], start=2):
-        token = raw_token.strip(b" \t\r\n")
+        token_start = cursor
+        token_end = token_start + len(raw_token)  # terminator sits here
+        cursor = token_end + 1
+
+        token = raw_token.strip(strip_chars)
+        # First byte of the segment proper, after any tolerated leading
+        # whitespace; for an ST segment this is the first byte of the tag.
+        segment_start = token_start + (
+            len(raw_token) - len(raw_token.lstrip(strip_chars))
+        )
 
         # A final empty token is produced by the trailing segment terminator
         # (optionally followed by line breaks).  Any other blank token is an
@@ -269,6 +324,8 @@ def audit(raw: bytes) -> AuditResult:
             current_txn = _Transaction(
                 st_index=position,
                 control_number=parts[2],
+                st01=parts[1],
+                byte_start=segment_start,
             )
 
         elif tag == b"SE":
@@ -313,6 +370,10 @@ def audit(raw: bytes) -> AuditResult:
                     "SE02 control number does not match ST02",
                     position,
                 )
+            current_txn.se_index = position
+            # token_end is the offset of the segment terminator byte; the
+            # half-open span runs one beyond it to include it.
+            current_txn.byte_end = token_end + 1
             current_group.transactions.append(current_txn)
             current_txn = None
 
@@ -449,9 +510,36 @@ def audit(raw: bytes) -> AuditResult:
         )
 
     transaction_count = sum(len(group.transactions) for group in groups)
+
+    transactions: tuple[TransactionDetail, ...] = ()
+    if include_transactions:
+        # Assembled strictly after successful validation: the grouping and
+        # nesting above is authoritative, and the digests are computed
+        # directly over slices of the original bytes (no normalization of
+        # line breaks, whitespace or delimiters).
+        entries: list[TransactionDetail] = []
+        for group in groups:
+            gs06 = group.control_number.decode("ascii")
+            for txn in group.transactions:
+                span = raw[txn.byte_start : txn.byte_end]
+                entries.append(
+                    TransactionDetail(
+                        gs_control_number=gs06,
+                        st01=txn.st01.decode("ascii"),
+                        st02=txn.control_number.decode("ascii"),
+                        st_segment=txn.st_index,
+                        se_segment=txn.se_index,
+                        byte_start=txn.byte_start,
+                        byte_end=txn.byte_end,
+                        sha256=hashlib.sha256(span).hexdigest(),
+                    )
+                )
+        transactions = tuple(entries)
+
     return AuditResult(
         interchange_control_number=interchange_control,
         group_count=len(groups),
         transaction_count=transaction_count,
         sha256=hashlib.sha256(raw).hexdigest(),
+        transactions=transactions,
     )

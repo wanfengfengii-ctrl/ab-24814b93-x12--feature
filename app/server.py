@@ -15,6 +15,14 @@ POST /api/x12/audit
           "sha256": "..."
         }
 
+    With the optional ``?detail=transactions`` query parameter the success
+    body additionally carries a ``transactions`` array ordered by functional
+    group and document position.  Each entry gives GS06, ST01, ST02, the
+    1-based closed ST..SE segment range, the zero-based half-open byte range
+    (ST tag first byte through the SE segment terminator) and the lowercase
+    SHA-256 of exactly that raw slice.  Any other ``detail`` value is a 400
+    request error; omitting the parameter leaves the response unchanged.
+
     Failure (4xx)::
 
         {
@@ -24,6 +32,8 @@ POST /api/x12/audit
             "segment": 7
           }
         }
+
+    Envelope failures never carry a partial transaction list.
 
 GET /health
     Liveness/readiness probe.  Returns ``{"status": "ok"}`` with 200 once the
@@ -37,11 +47,17 @@ import logging
 import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qsl, urlsplit
 
 from .audit import MAX_MESSAGE_BYTES, EnvelopeError, audit
 
 AUDIT_PATH = "/api/x12/audit"
 HEALTH_PATH = "/health"
+
+# Only supported value of the optional ``detail`` query parameter; when
+# present the success body additionally lists every transaction set with
+# its raw-byte span and SHA-256 evidence.
+DETAIL_TRANSACTIONS = "transactions"
 
 logger = logging.getLogger("x12-audit")
 
@@ -106,7 +122,8 @@ class AuditHandler(BaseHTTPRequestHandler):
             )
 
     def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
-        if self.path.split("?", 1)[0] != AUDIT_PATH:
+        url = urlsplit(self.path)
+        if url.path != AUDIT_PATH:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -118,6 +135,18 @@ class AuditHandler(BaseHTTPRequestHandler):
                 close=not keep_alive,
             )
             return
+
+        # Parse the optional ?detail= query parameter.  Only "transactions"
+        # is accepted; omitting the parameter preserves the default response
+        # exactly, anything else is a 400 request error.
+        detail_values = [
+            value
+            for key, value in parse_qsl(url.query, keep_blank_values=True)
+            if key == "detail"
+        ]
+        include_transactions = bool(detail_values) and all(
+            value == DETAIL_TRANSACTIONS for value in detail_values
+        )
 
         try:
             length = int(self.headers.get("Content-Length", "0"))
@@ -170,9 +199,29 @@ class AuditHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # Query-shape errors are rejected only after the transport-level
+        # checks above, preserving their original precedence; the body has
+        # not been consumed yet so it can be drained for keep-alive.
+        if detail_values and not include_transactions:
+            keep_alive = self._drain(length)
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {
+                    "error": {
+                        "code": "INVALID_DETAIL_PARAMETER",
+                        "message": (
+                            "the only supported value of the detail query "
+                            "parameter is 'transactions'"
+                        ),
+                    }
+                },
+                close=not keep_alive,
+            )
+            return
+
         raw = self.rfile.read(length) if length else b""
         try:
-            result = audit(raw)
+            result = audit(raw, include_transactions=include_transactions)
         except EnvelopeError as exc:
             logger.info("audit failed: %s at segment %s", exc.code, exc.segment)
             self._send_json(
@@ -187,15 +236,25 @@ class AuditHandler(BaseHTTPRequestHandler):
             )
             return
 
-        self._send_json(
-            HTTPStatus.OK,
-            {
-                "interchange_control_number": result.interchange_control_number,
-                "group_count": result.group_count,
-                "transaction_count": result.transaction_count,
-                "sha256": result.sha256,
-            },
-        )
+        payload = {
+            "interchange_control_number": result.interchange_control_number,
+            "group_count": result.group_count,
+            "transaction_count": result.transaction_count,
+            "sha256": result.sha256,
+        }
+        if include_transactions:
+            payload["transactions"] = [
+                {
+                    "gs06": entry.gs_control_number,
+                    "st01": entry.st01,
+                    "st02": entry.st02,
+                    "segment_range": [entry.st_segment, entry.se_segment],
+                    "byte_range": [entry.byte_start, entry.byte_end],
+                    "sha256": entry.sha256,
+                }
+                for entry in result.transactions
+            ]
+        self._send_json(HTTPStatus.OK, payload)
 
     def log_message(self, fmt: str, *args: object) -> None:
         logger.debug(fmt, *args)

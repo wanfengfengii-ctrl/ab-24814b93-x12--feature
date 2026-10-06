@@ -39,6 +39,31 @@
 }
 ```
 
+可选查询参数 `detail=transactions` 启用结算取证明细：成功响应在原有字段之外
+追加 `transactions` 数组，按功能组（GS06 关联）与组内报文顺序排列。每项为：
+
+```json
+{
+  "gs06": "1",
+  "st01": "850",
+  "st02": "1001",
+  "segment_range": [3, 5],
+  "byte_range": [153, 184],
+  "sha256": "3f7b9c…"
+}
+```
+
+- `segment_range`：一基闭合段区间，`[ST 段序号, 配对 SE 段序号]`（ISA 为 1）。
+- `byte_range`：零基半开字节区间 `[start, end)`，`raw[start:end]` 从 ST 标签
+  首字节覆盖到配对 SE 的段终止符（含终止符）。
+- `sha256`：直接对该**原始字节切片**计算的小写十六进制 SHA-256；不做任何换行、
+  空白或分隔符层面的归一化，自定义分隔符（含 CR/LF 段终止符）下偏移与内容一致。
+
+明细只在整个信封审计成功后汇总；任何信封错误仍返回既有首个可定位错误，响应中
+不会附带部分事务清单，明细计算也不会掩盖更早的内层错误。省略 `detail` 参数时
+状态码、响应字段与错误语义完全不变；`detail` 取任何其他值（含空值、重复参数中
+的非法值）一律以 400 `INVALID_DETAIL_PARAMETER` 拒绝。
+
 失败（信封类错误 422；空报文/非 ASCII 为 400；超过 2 MiB 为 413；
 Content-Type 错误为 415）：
 
@@ -59,6 +84,7 @@ Content-Type 错误为 415）：
 | code | 含义 |
 |---|---|
 | `EMPTY_MESSAGE` / `MESSAGE_TOO_LARGE` / `NON_ASCII` | 报文体量或编码问题 |
+| `INVALID_DETAIL_PARAMETER` | `detail` 查询参数取了 `transactions` 以外的值（400） |
 | `MISSING_ISA` / `ISA_TOO_SHORT` / `ISA_MALFORMED` / `BAD_DELIMITER` | ISA 定长结构或分隔符非法 |
 | `MULTIPLE_INTERCHANGES` | 出现第二个 ISA（拼接报文） |
 | `TRAILING_DATA` | IEA 之后还有数据 |
@@ -100,9 +126,10 @@ docker compose up --build --abort-on-container-exit --exit-code-from verify veri
 `verify` 服务依次执行：
 
 1. 等待 `http://api:8080/health` 就绪；
-2. 单元测试（unittest，47 个用例）；
+2. 单元测试（unittest，55 个用例，含取证明细与自定义分隔符用例）；
 3. 应用构建检查（`compileall` 字节编译）；
-4. HTTP 冒烟（有效报文 + 多种损坏信封 + 传输层错误）。
+4. HTTP 冒烟（有效报文 + 多种损坏信封 + 传输层错误 + 默认模式兼容性 +
+   `detail=transactions` 明细与非法参数拒绝）。
 
 退出码按位汇总：`1` 健康超时、`2` 单元测试失败、`4` 构建检查失败、`8` HTTP 冒烟失败；
 `0` 表示全部通过。
@@ -113,4 +140,9 @@ docker compose up --build --abort-on-container-exit --exit-code-from verify veri
 curl -sS --data-binary @sample.edi \
   -H 'Content-Type: application/octet-stream' \
   http://localhost:8080/api/x12/audit
+
+# 带事务集原始字节取证明细
+curl -sS --data-binary @sample.edi \
+  -H 'Content-Type: application/octet-stream' \
+  'http://localhost:8080/api/x12/audit?detail=transactions'
 ```

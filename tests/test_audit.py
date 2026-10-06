@@ -491,5 +491,137 @@ class CountAndControlTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "TRANSACTION_LIMIT_EXCEEDED")
 
 
+class TransactionDetailTests(unittest.TestCase):
+    def test_default_mode_carries_no_transaction_list(self):
+        result = audit(build_message([[1, 0], [0]]))
+        self.assertEqual(result.transactions, ())
+
+    def test_detail_fields_and_ordering(self):
+        raw = build_message([[1, 0], [2]])
+        result = audit(raw, include_transactions=True)
+        self.assertEqual(result.transaction_count, 3)
+        self.assertEqual(len(result.transactions), 3)
+
+        expected = [
+            # (gs06, st01, st02, st_segment, se_segment)
+            ("1", "850", "1001", 3, 5),   # ST + BEG + SE
+            ("1", "850", "1002", 6, 7),   # bare ST/SE
+            ("2", "850", "2001", 10, 13),  # ST + two payload + SE
+        ]
+        for entry, (gs06, st01, st02, st_seg, se_seg) in zip(
+            result.transactions, expected
+        ):
+            self.assertEqual(entry.gs_control_number, gs06)
+            self.assertEqual(entry.st01, st01)
+            self.assertEqual(entry.st02, st02)
+            self.assertEqual(entry.st_segment, st_seg)
+            self.assertEqual(entry.se_segment, se_seg)
+
+    def test_byte_spans_cover_st_through_se_terminator(self):
+        raw = build_message([[1, 0], [2]])
+        result = audit(raw, include_transactions=True)
+        previous_end = -1
+        previous_gs = None
+        for entry in result.transactions:
+            # The half-open slice must start exactly at an ST tag and end
+            # right after the paired SE terminator.
+            span = raw[entry.byte_start : entry.byte_end]
+            self.assertTrue(span.startswith(b"ST*"), span)
+            self.assertTrue(span.endswith(b"~"), span)
+            self.assertEqual(
+                span[: 2 + 1 + len(entry.st01) + 1 + len(entry.st02)],
+                f"ST*{entry.st01}*{entry.st02}".encode(),
+            )
+            self.assertIn(
+                f"SE*{entry.se_segment - entry.st_segment + 1}"
+                f"*{entry.st02}~".encode(),
+                span,
+            )
+            # Spans are strictly ordered; consecutive transactions within
+            # one group are byte-adjacent (the GS/GE segments sit between
+            # groups, so a new group starts strictly later).
+            self.assertGreaterEqual(entry.byte_start, previous_end)
+            if previous_gs is not None:
+                if entry.gs_control_number == previous_gs:
+                    self.assertEqual(entry.byte_start, previous_end)
+                else:
+                    self.assertGreater(entry.byte_start, previous_end)
+            previous_end = entry.byte_end
+            previous_gs = entry.gs_control_number
+            # Digest is computed over the raw slice only.
+            self.assertEqual(
+                entry.sha256, hashlib.sha256(span).hexdigest()
+            )
+            self.assertRegex(entry.sha256, r"^[0-9a-f]{64}$")
+
+    def test_byte_spans_with_custom_delimiters(self):
+        raw = build_message(
+            [[1, 0]], element="|", component="^", terminator="\n"
+        )
+        result = audit(raw, include_transactions=True)
+        spans = [
+            b"ST|850|1001\nBEG00|00\nSE|3|1001\n",
+            b"ST|850|1002\nSE|2|1002\n",
+        ]
+        self.assertEqual(len(result.transactions), 2)
+        cursor = None
+        for entry, expected in zip(result.transactions, spans):
+            self.assertEqual(entry.gs_control_number, "1")
+            self.assertEqual(raw[entry.byte_start : entry.byte_end], expected)
+            if cursor is not None:
+                # Same group: the two transactions are byte-adjacent.
+                self.assertEqual(entry.byte_start, cursor)
+            cursor = entry.byte_end
+            self.assertEqual(
+                entry.sha256,
+                hashlib.sha256(expected).hexdigest(),
+            )
+
+    def test_byte_spans_with_punctuation_terminator(self):
+        raw = build_message(
+            [[0]], element="@", component="%", terminator="#"
+        )
+        result = audit(raw, include_transactions=True)
+        entry = result.transactions[0]
+        self.assertEqual(
+            raw[entry.byte_start : entry.byte_end],
+            b"ST@850@1001#SE@2@1001#",
+        )
+
+    def test_leading_whitespace_does_not_shift_span(self):
+        raw = build_message([[0]]).replace(
+            b"ST*850*1001~", b"  ST*850*1001~", 1
+        )
+        result = audit(raw, include_transactions=True)
+        entry = result.transactions[0]
+        span = raw[entry.byte_start : entry.byte_end]
+        self.assertTrue(span.startswith(b"ST"))
+        self.assertTrue(span.endswith(b"~"))
+        self.assertEqual(entry.sha256, hashlib.sha256(span).hexdigest())
+
+    def test_trailing_line_break_excluded_from_final_slice(self):
+        raw = build_message([[0]]) + b"\r\n"
+        result = audit(raw, include_transactions=True)
+        entry = result.transactions[0]
+        self.assertEqual(
+            raw[entry.byte_start : entry.byte_end],
+            b"ST*850*1001~SE*2*1001~",
+        )
+
+    def test_detail_does_not_mask_inner_envelope_error(self):
+        # SE01 wrong while GE01/IEA01 are also wrong: with detail requested
+        # the innermost, earliest error must still be the only result.
+        raw = (
+            isa()
+            + "GS*PO*S*R*20240101*1200*1*X*005010~"
+            + "ST*850*100~BEG*00~SE*2*100~"
+            + "GE*9*1~IEA*9*000000001~"
+        ).encode("ascii")
+        with self.assertRaises(EnvelopeError) as ctx:
+            audit(raw, include_transactions=True)
+        self.assertEqual(ctx.exception.code, "SEGMENT_COUNT_MISMATCH")
+        self.assertEqual(ctx.exception.segment, 5)
+
+
 if __name__ == "__main__":
     unittest.main()
