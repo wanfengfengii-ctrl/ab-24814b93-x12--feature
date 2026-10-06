@@ -54,6 +54,50 @@ Content-Type 错误为 415）：
 
 `segment` 为首个可定位错误的 1 基段序号（ISA 为 1）。
 
+#### `detail=transactions` 明细取证模式
+
+附加查询参数 `?detail=transactions` 后，成功响应在原汇总字段之外增加
+`transactions` 数组，按功能组（GS 顺序）与组内报文顺序列出每个已通过校验的
+ST/SE 事务集。省略该参数时状态码、响应字段与错误语义完全不变。
+
+```json
+{
+  "interchange_control_number": "000000001",
+  "group_count": 1,
+  "transaction_count": 1,
+  "sha256": "f826db39…",
+  "transactions": [
+    {
+      "gs06": "1",
+      "st01": "850",
+      "st02": "0001",
+      "segment_start": 3,
+      "segment_end": 6,
+      "byte_start": 106,
+      "byte_end": 142,
+      "sha256": "9f2a…"
+    }
+  ]
+}
+```
+
+每项字段：
+
+| 字段 | 含义 |
+|---|---|
+| `gs06` / `st01` / `st02` | 所属功能组控制号（GS06）、事务集标识代码（ST01）与事务控制号（ST02） |
+| `segment_start` / `segment_end` | ST 到 SE 的 **1 基闭合**段序号（均含端点） |
+| `byte_start` / `byte_end` | **0 基半开**字节区间：自 `ST` 标签首字节起，至配对 `SE` 段终止符（含）之后，即 `raw[byte_start:byte_end]` |
+| `sha256` | 直接对该**原始字节切片**计算的小写 SHA-256，不做任何空白或分隔符重写 |
+
+字节区间始终取自请求原文的一次线性扫描：段间换行/空白不产生偏移漂移，自定义
+元素分隔符、组件分隔符与段终止符（含 CR/LF）均原样保留。任何信封错误仍只返回
+既有首个可定位错误（状态码与错误结构不变），响应中不附带部分事务清单，明细
+计算也不会掩盖更早的内层错误。
+
+`detail` 取其他值（含空值，或多次出现且任一值不为 `transactions`）按请求错误
+拒绝：`400`，错误码 `INVALID_QUERY_PARAMETER`。
+
 稳定错误码：
 
 | code | 含义 |
@@ -72,6 +116,7 @@ Content-Type 错误为 415）：
 | `CONTROL_NUMBER_MISMATCH` | 成对控制号不一致 |
 | `MISSING_SE` / `MISSING_GE` / `MISSING_IEA` | 报文截断、缺少闭合段 |
 | `UNEXPECTED_SEGMENT` | 信封段之外的段出现在事务集外 |
+| `INVALID_QUERY_PARAMETER`（400） | `detail` 查询参数取值非法（仅允许省略或 `transactions`） |
 
 ### `GET /health`
 
@@ -100,9 +145,10 @@ docker compose up --build --abort-on-container-exit --exit-code-from verify veri
 `verify` 服务依次执行：
 
 1. 等待 `http://api:8080/health` 就绪；
-2. 单元测试（unittest，47 个用例）；
+2. 单元测试（unittest，55 个用例，含事务取证明细用例）；
 3. 应用构建检查（`compileall` 字节编译）；
-4. HTTP 冒烟（有效报文 + 多种损坏信封 + 传输层错误）。
+4. HTTP 冒烟（默认模式兼容性、明细模式与自定义分隔符、非法参数、
+   有效报文 + 多种损坏信封 + 传输层错误）。
 
 退出码按位汇总：`1` 健康超时、`2` 单元测试失败、`4` 构建检查失败、`8` HTTP 冒烟失败；
 `0` 表示全部通过。
@@ -113,4 +159,9 @@ docker compose up --build --abort-on-container-exit --exit-code-from verify veri
 curl -sS --data-binary @sample.edi \
   -H 'Content-Type: application/octet-stream' \
   http://localhost:8080/api/x12/audit
+
+# 明细取证模式：返回每个事务集的段/字节区间与原文切片 SHA-256
+curl -sS --data-binary @sample.edi \
+  -H 'Content-Type: application/octet-stream' \
+  http://localhost:8080/api/x12/audit?detail=transactions
 ```

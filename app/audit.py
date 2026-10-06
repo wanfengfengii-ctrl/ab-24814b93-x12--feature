@@ -19,6 +19,15 @@ Every error is reported at the first segment where it is locatable.  Because
 segments are processed strictly in document order, an inner envelope error
 (SE/GE level) is always raised before any later outer summary (IEA level)
 could mask it.
+
+On success the audit also produces, for every ST/SE transaction set in
+functional-group/document order, forensic evidence: the 1-based closed
+segment interval, the 0-based half-open byte interval spanning the raw
+bytes from the first byte of the ``ST`` tag through the paired ``SE``
+segment terminator, and a lowercase SHA-256 of that exact byte slice.  The
+slice is always taken from the original request bytes, so line breaks,
+surrounding whitespace and custom delimiters never shift offsets or
+rewrite content.
 """
 
 from __future__ import annotations
@@ -50,17 +59,47 @@ class EnvelopeError(Exception):
 
 
 @dataclass(frozen=True)
+class TransactionDetail:
+    """Forensic evidence for one validated ST/SE transaction set.
+
+    ``segment_start``/``segment_end`` are 1-based closed segment indices
+    (ST and SE inclusive).  ``byte_start``/``byte_end`` are 0-based
+    half-open byte offsets into the original message, from the first byte
+    of the ST tag (byte_start) through the SE segment terminator
+    (byte_end, exclusive).  ``sha256`` digests that exact raw slice.
+    """
+
+    gs_control_number: str
+    st_tag: str
+    st_control_number: str
+    segment_start: int
+    segment_end: int
+    byte_start: int
+    byte_end: int
+    sha256: str
+
+
+@dataclass(frozen=True)
 class AuditResult:
     interchange_control_number: str
     group_count: int
     transaction_count: int
     sha256: str
+    transactions: tuple[TransactionDetail, ...] = ()
 
 
 @dataclass
 class _Transaction:
     st_index: int
     control_number: bytes
+    # ST01 identifier code, e.g. b"850".
+    st_tag: bytes = b""
+    # 1-based segment index of the matching SE segment.
+    se_index: int = 0
+    # Byte offset of the first byte of the ST tag in the raw message.
+    byte_start: int = 0
+    # Byte offset one past the SE segment terminator; set when SE closes.
+    byte_end: int = 0
 
 
 @dataclass
@@ -148,8 +187,24 @@ def audit(raw: bytes) -> AuditResult:
         )
     interchange_control = isa_parts[13].decode("ascii").strip()
 
-    raw_tokens = raw.split(terminator_byte)
-    if raw_tokens[0] != isa_core:
+    # Split on the terminator while remembering each segment's byte
+    # span.  Evidence slices must point at the exact original bytes
+    # (including any inter-segment line breaks), so the offsets come from
+    # a single linear scan rather than from stripped tokens.  Each entry
+    # is (start_offset, end_offset_exclusive, content_without_terminator).
+    segments: list[tuple[int, int, bytes]] = []
+    scan = 0
+    while True:
+        terminator_at = raw.find(terminator_byte, scan)
+        if terminator_at == -1:
+            segments.append((scan, len(raw), raw[scan:]))
+            break
+        segments.append(
+            (scan, terminator_at + 1, raw[scan:terminator_at])
+        )
+        scan = terminator_at + 1
+
+    if segments[0][2] != isa_core:
         # Only possible if the terminator byte occurs inside the ISA header,
         # which the fixed-width validation above normally catches first.
         raise EnvelopeError("ISA_MALFORMED", "malformed ISA segment", 1)
@@ -157,31 +212,34 @@ def audit(raw: bytes) -> AuditResult:
     # A trailing terminator is mandatory; its absence usually means the
     # message was truncated.  CRLF/LF line endings after the final
     # terminator are tolerated.
-    if raw_tokens[-1].strip(b" \t\r\n") != b"":
+    if segments[-1][2].strip(b" \t\r\n") != b"":
         raise EnvelopeError(
             "MISSING_TERMINATOR",
             "final segment is missing its segment terminator; the message "
             "may be truncated",
-            len(raw_tokens),
+            len(segments),
         )
 
     groups: list[_Group] = []
     current_group: _Group | None = None
     current_txn: _Transaction | None = None
     closed = False
-    last_segment_index = max(len(raw_tokens) - 1, 1)
+    last_segment_index = max(len(segments) - 1, 1)
 
     def tag_of(token: bytes) -> bytes:
         return token.split(element_sep_byte, 1)[0].strip()
 
-    for position, raw_token in enumerate(raw_tokens[1:], start=2):
+    # Segments are 1-based; index 0 is the fixed-width ISA segment.
+    for seg_index in range(1, len(segments)):
+        seg_start, seg_end, raw_token = segments[seg_index]
+        position = seg_index + 1
         token = raw_token.strip(b" \t\r\n")
 
         # A final empty token is produced by the trailing segment terminator
         # (optionally followed by line breaks).  Any other blank token is an
         # empty segment.
         if not token:
-            if position == len(raw_tokens):
+            if seg_index == len(segments) - 1:
                 continue
             raise EnvelopeError(
                 "EMPTY_SEGMENT", "empty segment encountered", position
@@ -269,6 +327,14 @@ def audit(raw: bytes) -> AuditResult:
             current_txn = _Transaction(
                 st_index=position,
                 control_number=parts[2],
+                st_tag=parts[1],
+                # Skip any leading whitespace inside the token (e.g. line
+                # breaks between segments) so the slice starts exactly at
+                # the first byte of the ST tag.  Use the same whitespace
+                # set as the parser's strip().
+                byte_start=seg_start
+                + len(raw_token)
+                - len(raw_token.lstrip(b" \t\r\n")),
             )
 
         elif tag == b"SE":
@@ -313,6 +379,9 @@ def audit(raw: bytes) -> AuditResult:
                     "SE02 control number does not match ST02",
                     position,
                 )
+            current_txn.se_index = position
+            # seg_end is one past the SE segment terminator byte.
+            current_txn.byte_end = seg_end
             current_group.transactions.append(current_txn)
             current_txn = None
 
@@ -449,9 +518,38 @@ def audit(raw: bytes) -> AuditResult:
         )
 
     transaction_count = sum(len(group.transactions) for group in groups)
+
+    details: list[TransactionDetail] = []
+    for group in groups:
+        gs_control = group.control_number.decode("ascii")
+        for txn in group.transactions:
+            evidence = raw[txn.byte_start : txn.byte_end]
+            # Defensive invariants: the slice must be exactly the original
+            # ST..SE bytes, starting at the ST tag and ending at the SE
+            # terminator.  These can only fail on an auditor bug.
+            if not evidence.startswith(b"ST") or evidence[-1:] != terminator_byte:
+                raise EnvelopeError(
+                    "AUDIT_INTERNAL",
+                    "transaction evidence slice bounds are inconsistent",
+                    txn.st_index,
+                )
+            details.append(
+                TransactionDetail(
+                    gs_control_number=gs_control,
+                    st_tag=txn.st_tag.decode("ascii"),
+                    st_control_number=txn.control_number.decode("ascii"),
+                    segment_start=txn.st_index,
+                    segment_end=txn.se_index,
+                    byte_start=txn.byte_start,
+                    byte_end=txn.byte_end,
+                    sha256=hashlib.sha256(evidence).hexdigest(),
+                )
+            )
+
     return AuditResult(
         interchange_control_number=interchange_control,
         group_count=len(groups),
         transaction_count=transaction_count,
         sha256=hashlib.sha256(raw).hexdigest(),
+        transactions=tuple(details),
     )

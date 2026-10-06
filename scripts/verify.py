@@ -5,7 +5,12 @@ Steps, in order:
 1. wait for the API health endpoint,
 2. run the unit test suite (``unittest``),
 3. run the application build check (``compileall``),
-4. run HTTP smoke tests covering valid and damaged envelopes.
+4. run HTTP smoke tests covering:
+   * default-mode response compatibility,
+   * ``?detail=transactions`` evidence (byte intervals + SHA-256),
+   * detail mode with custom delimiters/whitespace,
+   * invalid ``detail`` values and envelope-error semantics,
+   * valid and damaged envelopes.
 
 The process exits non-zero if any step fails; the exit code uses distinct
 bits so logs (and CI) can tell which step failed:

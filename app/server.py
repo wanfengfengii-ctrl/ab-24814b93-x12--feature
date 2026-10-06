@@ -15,6 +15,14 @@ POST /api/x12/audit
           "sha256": "..."
         }
 
+    With ``?detail=transactions`` the success body additionally contains a
+    ``transactions`` array ordered by functional group and document order;
+    each entry gives GS06, ST01, ST02, the 1-based closed ST..SE segment
+    interval, the 0-based half-open byte interval (first byte of the ST tag
+    through the SE segment terminator) and a lowercase SHA-256 of that exact
+    raw slice.  Any other ``detail`` value is rejected as a 400 request
+    error.
+
     Failure (4xx)::
 
         {
@@ -37,6 +45,7 @@ import logging
 import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qsl
 
 from .audit import MAX_MESSAGE_BYTES, EnvelopeError, audit
 
@@ -57,6 +66,26 @@ def _status_for(code: str) -> int:
     if code in _BAD_REQUEST_CODES:
         return HTTPStatus.BAD_REQUEST
     return HTTPStatus.UNPROCESSABLE_ENTITY
+
+
+def _detail_transactions_from_query(query: str) -> bool:
+    """Return whether ``detail=transactions`` was requested.
+
+    The parameter may be omitted (returns False) or set exactly to
+    ``transactions`` (returns True).  Any other value -- including an
+    empty value or a second occurrence with a different value -- raises
+    ``ValueError`` (a 400 request error).
+    """
+    detail_values = [
+        value
+        for key, value in parse_qsl(query, keep_blank_values=True)
+        if key == "detail"
+    ]
+    if any(value != "transactions" for value in detail_values):
+        raise ValueError(
+            "the 'detail' query parameter, when present, must be 'transactions'"
+        )
+    return bool(detail_values)
 
 
 class AuditHandler(BaseHTTPRequestHandler):
@@ -106,7 +135,8 @@ class AuditHandler(BaseHTTPRequestHandler):
             )
 
     def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
-        if self.path.split("?", 1)[0] != AUDIT_PATH:
+        path, _, query = self.path.partition("?")
+        if path != AUDIT_PATH:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -115,6 +145,21 @@ class AuditHandler(BaseHTTPRequestHandler):
             self._send_json(
                 HTTPStatus.NOT_FOUND,
                 {"error": {"code": "NOT_FOUND", "message": "unknown path"}},
+                close=not keep_alive,
+            )
+            return
+
+        try:
+            include_transactions = _detail_transactions_from_query(query)
+        except ValueError as exc:
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
+            keep_alive = length >= 0 and self._drain(length)
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": {"code": "INVALID_QUERY_PARAMETER", "message": str(exc)}},
                 close=not keep_alive,
             )
             return
@@ -187,15 +232,27 @@ class AuditHandler(BaseHTTPRequestHandler):
             )
             return
 
-        self._send_json(
-            HTTPStatus.OK,
-            {
-                "interchange_control_number": result.interchange_control_number,
-                "group_count": result.group_count,
-                "transaction_count": result.transaction_count,
-                "sha256": result.sha256,
-            },
-        )
+        payload = {
+            "interchange_control_number": result.interchange_control_number,
+            "group_count": result.group_count,
+            "transaction_count": result.transaction_count,
+            "sha256": result.sha256,
+        }
+        if include_transactions:
+            payload["transactions"] = [
+                {
+                    "gs06": txn.gs_control_number,
+                    "st01": txn.st_tag,
+                    "st02": txn.st_control_number,
+                    "segment_start": txn.segment_start,
+                    "segment_end": txn.segment_end,
+                    "byte_start": txn.byte_start,
+                    "byte_end": txn.byte_end,
+                    "sha256": txn.sha256,
+                }
+                for txn in result.transactions
+            ]
+        self._send_json(HTTPStatus.OK, payload)
 
     def log_message(self, fmt: str, *args: object) -> None:
         logger.debug(fmt, *args)

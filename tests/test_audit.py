@@ -491,5 +491,113 @@ class CountAndControlTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "TRANSACTION_LIMIT_EXCEEDED")
 
 
+class TransactionEvidenceTests(unittest.TestCase):
+    def test_details_ordered_by_group_and_document(self):
+        raw = build_message([[0, 2], [1]])
+        result = audit(raw)
+        details = result.transactions
+        self.assertEqual(len(details), 3)
+        self.assertEqual([d.gs_control_number for d in details], ["1", "1", "2"])
+        self.assertEqual([d.st_control_number for d in details], ["1001", "1002", "2001"])
+        self.assertEqual([d.st_tag for d in details], ["850", "850", "850"])
+
+    def test_segment_intervals_are_one_based_closed(self):
+        raw = build_message([[0, 2], [0]])
+        details = audit(raw).transactions
+        # ISA=1; group 1: GS=2, ST=3/SE=4, ST=5,payload 6,7,SE=8,
+        # GE=9; group 2: GS=10, ST=11,SE=12.
+        self.assertEqual(
+            [(d.segment_start, d.segment_end) for d in details],
+            [(3, 4), (5, 8), (11, 12)],
+        )
+
+    def test_byte_interval_spans_st_tag_to_se_terminator(self):
+        raw = build_message([[1, 0]])
+        details = audit(raw).transactions
+        for d in details:
+            evidence = raw[d.byte_start : d.byte_end]
+            self.assertEqual(evidence[:2], b"ST")
+            self.assertEqual(evidence[-1:], b"~")
+            self.assertTrue(evidence.startswith(b"ST*" + d.st_tag.encode()))
+            self.assertTrue(evidence.endswith(b"~"))
+            self.assertEqual(d.sha256, hashlib.sha256(evidence).hexdigest())
+            self.assertEqual(len(d.sha256), 64)
+            self.assertEqual(d.sha256, d.sha256.lower())
+
+        # Exact boundaries for the first transaction: ST at segment 3
+        # through SE at segment 5.
+        first = details[0]
+        st_offset = raw.index(b"ST*850*1001~")
+        se_end = raw.index(b"SE*3*1001~") + len(b"SE*3*1001~")
+        self.assertEqual(first.byte_start, st_offset)
+        self.assertEqual(first.byte_end, se_end)
+        self.assertEqual(
+            raw[first.byte_start : first.byte_end],
+            b"ST*850*1001~BEG00*00~SE*3*1001~",
+        )
+
+        # Half-open interval length is positive and strictly inside body.
+        self.assertLess(first.byte_end, len(raw))
+
+    def test_consecutive_transactions_have_adjacent_slices(self):
+        raw = build_message([[0, 0]])
+        details = audit(raw).transactions
+        # No bytes between SE of txn 1 and ST of txn 2 other than what
+        # each slice owns: first byte_end equals second byte_start.
+        self.assertEqual(details[0].byte_end, details[1].byte_start)
+
+    def test_custom_delimiters_and_newlines_no_offset_drift(self):
+        raw = (
+            isa(element="|", component="^", terminator="\n")
+            + "GS|PO|S|R|D|T|7|X|V\n"
+            + "  ST|850|42\n"
+            + "BEG|00\n"
+            + " SE|3|42\n"
+            + "GE|1|7\n"
+            + "IEA|1|000000001\n"
+        ).encode("ascii")
+        result = audit(raw)
+        (d,) = result.transactions
+        evidence = raw[d.byte_start : d.byte_end]
+        # Starts exactly at the ST tag (leading spaces excluded) and
+        # ends at (including) the SE newline terminator.
+        self.assertEqual(evidence, b"ST|850|42\nBEG|00\n SE|3|42\n")
+        self.assertEqual(d.sha256, hashlib.sha256(evidence).hexdigest())
+        self.assertEqual((d.segment_start, d.segment_end), (3, 5))
+        self.assertEqual(raw[d.byte_start : d.byte_start + 2], b"ST")
+        self.assertEqual(raw[d.byte_end - 1 : d.byte_end], b"\n")
+
+    def test_carriage_return_terminator(self):
+        raw = (
+            isa(element="*", component=":", terminator="\r")
+            + "GS*PO*S*R*D*T*1*X*V\r"
+            + "ST*850*9\rSE*2*9\r"
+            + "GE*1*1\r"
+            + "IEA*1*000000001\r"
+        ).encode("ascii")
+        (d,) = audit(raw).transactions
+        evidence = raw[d.byte_start : d.byte_end]
+        self.assertEqual(evidence, b"ST*850*9\rSE*2*9\r")
+        self.assertEqual(d.sha256, hashlib.sha256(evidence).hexdigest())
+
+    def test_component_separator_bytes_preserved_in_slice(self):
+        raw = (
+            isa()
+            + "GS*PO*S*R*20240101*1200*1*X*005010~"
+            + "ST*850*100~REF*AB:CD:EF~SE*3*100~"
+            + "GE*1*1~IEA*1*000000001~"
+        ).encode("ascii")
+        (d,) = audit(raw).transactions
+        evidence = raw[d.byte_start : d.byte_end]
+        self.assertIn(b"REF*AB:CD:EF~", evidence)
+        self.assertEqual(d.sha256, hashlib.sha256(evidence).hexdigest())
+
+    def test_default_audit_result_carries_details_without_flag(self):
+        # The audit() core always computes evidence; the HTTP layer
+        # decides whether to serialize it.
+        result = audit(build_message([[0]]))
+        self.assertEqual(len(result.transactions), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
